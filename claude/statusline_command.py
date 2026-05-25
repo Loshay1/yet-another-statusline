@@ -2929,15 +2929,15 @@ def _cl_style_badge(s: SessionInfo) -> str:
 
 
 def _cl_count_agents() -> int:
+    # Old behavior: find -L ~/.claude/agents -maxdepth 2 -name '*.md'
+    # Counts direct .md plus one level deep. Matches old statusline.sh.
     d = CLAUDE_DIR / 'agents'
     if not d.is_dir():
         return 0
     n = 0
     try:
-        for _ in d.rglob('*.md'):
-            n += 1
-            if n > 9999:
-                break
+        n += sum(1 for _ in d.glob('*.md'))
+        n += sum(1 for _ in d.glob('*/*.md'))
     except OSError:
         pass
     return n
@@ -2990,9 +2990,13 @@ def _cl_count_plugins() -> int:
 
 
 def _cl_count_skills() -> int:
+    # Old behavior: find -L ~/.claude/skills -maxdepth 4 -name SKILL.md
+    # Depth 4 covers: plugin/skill/SKILL.md and namespaced plugin/group/skill/SKILL.md.
+    # Deeper paths (e.g. plugin/.factory/skills/*) are sub-bundles, not user-callable;
+    # excluding them matches old statusline.sh and the user's mental model.
     cache = CLAUDE_DIR / '.skill-count.cache'
     try:
-        if time.time() - cache.stat().st_mtime < 86400:
+        if time.time() - cache.stat().st_mtime < 3600:  # 1h ttl (was 24h, too stale)
             return int(cache.read_text().strip())
     except (OSError, ValueError):
         pass
@@ -3000,10 +3004,9 @@ def _cl_count_skills() -> int:
     skills_dir = CLAUDE_DIR / 'skills'
     if skills_dir.is_dir():
         try:
-            for _ in skills_dir.rglob('SKILL.md'):
-                n += 1
-                if n > 9999:
-                    break
+            # Each '*' equals one path component below skills/; depth 4 → 3 wildcards.
+            for pattern in ('*/SKILL.md', '*/*/SKILL.md', '*/*/*/SKILL.md'):
+                n += sum(1 for _ in skills_dir.glob(pattern))
         except OSError:
             pass
     try:
