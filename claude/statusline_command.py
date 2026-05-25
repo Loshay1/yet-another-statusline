@@ -2046,6 +2046,9 @@ class Renderer:
         return rate_text, right_text, right_w
 
     def plugins_skills(self, skills_count: int, skills_names: str, plugin_names: str) -> str:
+        # Local trim: hide plugins + skills row entirely. Override with YAS_SHOW_PLUGINS=1.
+        if os.environ.get('YAS_SHOW_PLUGINS') != '1':
+            return ''
         step = rainbow_step()
         c_skills = rainbow_at(step, 3)
         c_plugins = rainbow_at(step, 6)
