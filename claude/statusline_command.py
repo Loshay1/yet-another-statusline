@@ -2816,6 +2816,348 @@ def render(session_info: dict, width: int, *, bg_shift: str = 'warm', theme: The
     return '\n'.join(render_layout(spec, r))
 
 
+# ============================================================================
+# Classic layout — port of larab's previous 6-row dashboard. Opt-in via
+# --layout=classic (or CLAUDE_STATUSLINE_LAYOUT=classic). Self-contained
+# rendering path: does NOT touch the upstream Renderer / Theme system, so
+# upstream rebases stay clean. All helpers prefixed with _cl_.
+# ============================================================================
+
+import subprocess as _sp
+
+_CL_RST  = '\x1b[0m'
+_CL_BOLD = '\x1b[1m'
+_CL_DIM  = '\x1b[38;5;244m'
+_CL_GRN  = '\x1b[32m'
+_CL_YLW  = '\x1b[33m'
+_CL_RED  = '\x1b[31m'
+_CL_CYN  = '\x1b[36m'
+_CL_ORG  = '\x1b[38;5;208m'
+_CL_CAV  = '\x1b[38;5;172m'
+
+
+def _cl_fmt_tokens(n: int) -> str:
+    if not n or n <= 0:
+        return '0'
+    if n >= 1_000_000:
+        return f'{n / 1_000_000:.1f}M'
+    if n >= 1_000:
+        return f'{n / 1_000:.1f}k'
+    return str(n)
+
+
+def _cl_build_bar(pct: int, width: int = 10) -> str:
+    blocks = '█▉▊▋▌▍▎▏'
+    pct = max(0, min(100, pct))
+    total = width * 8
+    filled = pct * total // 100
+    full = filled // 8
+    rem  = filled % 8
+    bar  = '█' * full
+    if rem:
+        bar += blocks[8 - rem]
+    bar += '░' * (width - full - (1 if rem else 0))
+    if pct < 50:
+        color = _CL_GRN
+    elif pct < 80:
+        color = _CL_YLW
+    elif pct < 95:
+        color = _CL_ORG
+    else:
+        color = _CL_RED
+    return f'{color}{bar}{_CL_RST}'
+
+
+def _cl_ctx_pct(s: SessionInfo) -> int:
+    ctx = s.context_window
+    if ctx.used_percentage is not None:
+        try:
+            return int(round(float(ctx.used_percentage)))
+        except (TypeError, ValueError):
+            pass
+    if ctx.context_window_size > 0:
+        return int(round(100 * ctx.total_input_tokens / ctx.context_window_size))
+    return 0
+
+
+def _cl_caveman_badge() -> str:
+    flag = CLAUDE_DIR / '.caveman-active'
+    if not flag.is_file() or flag.is_symlink():
+        return ''
+    try:
+        raw = flag.read_text(errors='ignore').strip().lower()[:64]
+    except OSError:
+        return ''
+    mode = ''.join(c for c in raw if c.isalnum() or c == '-')
+    valid = {
+        '', 'lite', 'full', 'ultra',
+        'wenyan-lite', 'wenyan', 'wenyan-full', 'wenyan-ultra',
+        'commit', 'review', 'compress',
+    }
+    if mode == 'off' or mode not in valid:
+        return ''
+    label = '[CAVEMAN]' if mode in ('', 'full') else f'[CAVEMAN:{mode.upper()}]'
+    badge = f'{_CL_CAV}{label}{_CL_RST}'
+    if os.environ.get('CAVEMAN_STATUSLINE_SAVINGS', '1') != '0':
+        suffix_file = CLAUDE_DIR / '.caveman-statusline-suffix'
+        if suffix_file.is_file() and not suffix_file.is_symlink():
+            try:
+                suffix = suffix_file.read_text(errors='ignore').strip()[:64]
+            except OSError:
+                suffix = ''
+            if suffix:
+                badge += f' {_CL_CAV}{suffix}{_CL_RST} {_CL_DIM}saved{_CL_RST}'
+    return badge
+
+
+def _cl_perm_badge(raw: dict) -> str:
+    pm = raw.get('permission_mode') or raw.get('permissionMode') or ''
+    if pm in ('bypassPermissions', 'bypass'):
+        return f'{_CL_RED}⚠ bypass{_CL_RST}'
+    if pm == 'plan':
+        return f'{_CL_CYN}◆ plan{_CL_RST}'
+    if pm == 'acceptEdits':
+        return f'{_CL_YLW}✎ accept-edits{_CL_RST}'
+    return ''
+
+
+def _cl_style_badge(s: SessionInfo) -> str:
+    name = s.output_style.name
+    if name and name != 'default':
+        return f'{_CL_DIM}style:{_CL_RST}{name}'
+    return ''
+
+
+def _cl_count_agents() -> int:
+    d = CLAUDE_DIR / 'agents'
+    if not d.is_dir():
+        return 0
+    n = 0
+    try:
+        for _ in d.rglob('*.md'):
+            n += 1
+            if n > 9999:
+                break
+    except OSError:
+        pass
+    return n
+
+
+def _cl_count_mcps(cwd: str = '') -> int:
+    seen: set[str] = set()
+    # User-level: ~/.claude.json has mcpServers under that key
+    user = HOME / '.claude.json'
+    if user.is_file():
+        try:
+            data = json.loads(user.read_text())
+            for k in (data.get('mcpServers') or {}):
+                seen.add(k)
+        except (OSError, json.JSONDecodeError):
+            pass
+    # Shared: ~/.claude/shared-mcp-servers.json is flat dict (server name → config)
+    shared = CLAUDE_DIR / 'shared-mcp-servers.json'
+    if shared.is_file():
+        try:
+            data = json.loads(shared.read_text())
+            inner = data.get('mcpServers') if 'mcpServers' in data else data
+            if isinstance(inner, dict):
+                for k in inner:
+                    seen.add(k)
+        except (OSError, json.JSONDecodeError):
+            pass
+    # Project-level: $CWD/.mcp.json
+    if cwd:
+        local = Path(cwd) / '.mcp.json'
+        if local.is_file():
+            try:
+                data = json.loads(local.read_text())
+                for k in (data.get('mcpServers') or {}):
+                    seen.add(k)
+            except (OSError, json.JSONDecodeError):
+                pass
+    return len(seen)
+
+
+def _cl_count_plugins() -> int:
+    f = CLAUDE_DIR / 'settings.json'
+    if not f.is_file():
+        return 0
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0
+    return sum(1 for v in (data.get('enabledPlugins') or {}).values() if v is True)
+
+
+def _cl_count_skills() -> int:
+    cache = CLAUDE_DIR / '.skill-count.cache'
+    try:
+        if time.time() - cache.stat().st_mtime < 86400:
+            return int(cache.read_text().strip())
+    except (OSError, ValueError):
+        pass
+    n = 0
+    skills_dir = CLAUDE_DIR / 'skills'
+    if skills_dir.is_dir():
+        try:
+            for _ in skills_dir.rglob('SKILL.md'):
+                n += 1
+                if n > 9999:
+                    break
+        except OSError:
+            pass
+    try:
+        cache.write_text(str(n))
+    except OSError:
+        pass
+    return n
+
+
+def _cl_ccusage_totals() -> tuple[str, str]:
+    helper = CLAUDE_DIR / 'scripts' / 'ccusage-totals.sh'
+    if not helper.is_file() or not os.access(helper, os.X_OK):
+        return ('', '')
+    try:
+        r = _sp.run([str(helper)], capture_output=True, timeout=2, text=True)
+    except (OSError, _sp.TimeoutExpired):
+        return ('', '')
+    if r.returncode != 0:
+        return ('', '')
+    parts = r.stdout.strip().split('|')
+    if len(parts) >= 2:
+        return (parts[0], parts[-1])
+    return ('', '')
+
+
+def _cl_fmt_reset(epoch: int | None) -> str:
+    if not epoch:
+        return ''
+    delta = int(epoch) - int(time.time())
+    if delta <= 0:
+        return ''
+    if delta >= 86400:
+        return f'+{delta // 86400}d'
+    h, rem = divmod(delta, 3600)
+    m = rem // 60
+    return f'{h}h{m:02d}m' if h else f'{m}m'
+
+
+def _cl_branch(cwd: str) -> str:
+    if not cwd or not os.path.isdir(cwd):
+        return ''
+    try:
+        r = _sp.run(['git', '-C', cwd, 'branch', '--show-current'],
+                    capture_output=True, timeout=1, text=True)
+    except (OSError, _sp.TimeoutExpired):
+        return ''
+    if r.returncode != 0:
+        return ''
+    b = r.stdout.strip()
+    if not b:
+        return ''
+    return b[:15] + '...' if len(b) > 18 else b
+
+
+def render_classic(session_info: dict, width: int) -> str:  # noqa: C901
+    s   = SessionInfo.from_dict(session_info)
+    SEP = f' {_CL_DIM}│{_CL_RST} '
+    DOT = f' {_CL_DIM}·{_CL_RST} '
+
+    # L1: model | dir(branch) | caveman | perm | style
+    model_seg = f'{_CL_BOLD}{_CL_CYN}◆{_CL_RST} {_CL_BOLD}{s.model_name}{_CL_RST}'
+    cwd = s.workspace.current_dir or s.cwd
+    dir_seg = ''
+    if cwd:
+        name = os.path.basename(cwd.rstrip('/')) or cwd
+        if len(name) > 26:
+            name = name[:23] + '...'
+        dir_seg = f'{_CL_DIM}📁{_CL_RST} {_CL_BOLD}{name}{_CL_RST}'
+        branch = _cl_branch(cwd)
+        if branch:
+            dir_seg += f' {_CL_DIM}({branch}){_CL_RST}'
+
+    parts = [model_seg]
+    if dir_seg:
+        parts.append(dir_seg)
+    for extra in (_cl_caveman_badge(), _cl_perm_badge(session_info), _cl_style_badge(s)):
+        if extra:
+            parts.append(extra)
+    line1 = SEP.join(parts)
+
+    # L2: ctx bar · tokens
+    pct     = _cl_ctx_pct(s)
+    ctx_seg = f'{_CL_DIM}ctx{_CL_RST} {_cl_build_bar(pct, 10)} {_CL_BOLD}{pct}%{_CL_RST}'
+    cu      = s.context_window.current_usage
+    tok_in  = getattr(cu, 'input_tokens', 0) or 0
+    tok_cc  = getattr(cu, 'cache_creation_input_tokens', 0) or 0
+    tok_cr  = getattr(cu, 'cache_read_input_tokens', 0) or 0
+    tok_out = getattr(cu, 'output_tokens', 0) or 0
+    cache_t = tok_cc + tok_cr
+    tok_seg = (
+        f'{_CL_DIM}new{_CL_RST} {_CL_YLW}{_cl_fmt_tokens(tok_in)}{_CL_RST} '
+        f'{_CL_DIM}cache{_CL_RST} {_CL_CYN}{_cl_fmt_tokens(cache_t)}{_CL_RST} '
+        f'{_CL_DIM}out{_CL_RST} {_CL_GRN}{_cl_fmt_tokens(tok_out)}{_CL_RST}'
+    )
+    line2 = f'{ctx_seg}{DOT}{tok_seg}'
+
+    # L3: 5h bar + session cost
+    line3 = ''
+    rl5   = s.rate_limits.five_hour
+    if rl5 and rl5.used_percentage:
+        r5     = int(round(float(rl5.used_percentage)))
+        reset5 = _cl_fmt_reset(rl5.resets_at)
+        line3  = f'{_CL_DIM}5h  {_CL_RST}{_cl_build_bar(r5, 10)} {_CL_BOLD}{r5}%{_CL_RST}'
+        if reset5:
+            line3 += f' {_CL_DIM}@{reset5}{_CL_RST}'
+    cost = s.cost.total_cost_usd or 0.0
+    if cost > 0:
+        cost_seg = f'{_CL_RED}${cost:.4f}{_CL_RST}'
+        line3    = f'{line3}{SEP}{cost_seg}' if line3 else cost_seg
+
+    # L4: 7d bar
+    line4 = ''
+    rl7   = s.rate_limits.seven_day
+    if rl7 and rl7.used_percentage:
+        r7     = int(round(float(rl7.used_percentage)))
+        reset7 = _cl_fmt_reset(rl7.resets_at)
+        line4  = f'{_CL_DIM}7d  {_CL_RST}{_cl_build_bar(r7, 10)} {_CL_BOLD}{r7}%{_CL_RST}'
+        if reset7:
+            line4 += f' {_CL_DIM}@{reset7}{_CL_RST}'
+
+    # L5: ccusage 7d/30d · lines delta
+    line5  = ''
+    d7, d30 = _cl_ccusage_totals()
+    if d7 and d30:
+        line5 = (
+            f'{_CL_DIM}spend{_CL_RST}  {_CL_DIM}7d{_CL_RST} {_CL_RED}${d7}{_CL_RST} '
+            f'{_CL_DIM}·{_CL_RST} {_CL_DIM}30d{_CL_RST} {_CL_RED}${d30}{_CL_RST}'
+        )
+    la = s.cost.total_lines_added or 0
+    ld = s.cost.total_lines_removed or 0
+    if la > 0 or ld > 0:
+        ln_seg = f'{_CL_GRN}+{la}{_CL_RST}{_CL_DIM}/{_CL_RST}{_CL_RED}-{ld}{_CL_RST}'
+        line5  = f'{line5}{SEP}{ln_seg}' if line5 else ln_seg
+
+    # L6: infra counts
+    n_agents  = _cl_count_agents()
+    n_plugins = _cl_count_plugins()
+    n_mcp     = _cl_count_mcps(cwd)
+    n_skills  = _cl_count_skills()
+    infra_seg = (
+        f'{_CL_DIM}🤖{_CL_RST} {n_agents} {_CL_DIM}agents{_CL_RST}{DOT}'
+        f'{_CL_DIM}🔌{_CL_RST} {n_plugins} {_CL_DIM}plugins{_CL_RST}{DOT}'
+        f'{_CL_DIM}🖥{_CL_RST}  {n_mcp} {_CL_DIM}mcp{_CL_RST}{DOT}'
+        f'{_CL_DIM}🛠{_CL_RST}  {n_skills} {_CL_DIM}skills{_CL_RST}'
+    )
+
+    rows = [line1, line2]
+    for ln in (line3, line4, line5):
+        if ln:
+            rows.append(ln)
+    rows.append(infra_seg)
+    return '\n'.join(rows)
+
+
 def main() -> None:
     # Force UTF-8 on stdout so the script renders correctly on Windows
     # (cp1252 default codec can't encode box-drawing or Nerd Font glyphs,
@@ -2828,6 +3170,7 @@ def main() -> None:
         sys.stdout.reconfigure(encoding='utf-8')
     bg_shift   = 'warm'
     theme_name: str | None = None
+    layout = os.environ.get('CLAUDE_STATUSLINE_LAYOUT', '').lower() or 'default'
     args = sys.argv[1:]
     while args:
         a = args.pop(0)
@@ -2843,6 +3186,10 @@ def main() -> None:
             theme_name = args.pop(0)
         elif a.startswith('--theme='):
             theme_name = a.split('=', 1)[1]
+        elif a == '--layout' and args:
+            layout = args.pop(0).lower()
+        elif a.startswith('--layout='):
+            layout = a.split('=', 1)[1].lower()
 
     info  = json.loads(sys.stdin.read())
     theme = resolve_theme(theme_name)
@@ -2860,7 +3207,10 @@ def main() -> None:
         return
     width = max(MIN_WIDTH, min(MAX_WIDTH, raw_tw - 6))
 
-    sys.stdout.write(render(info, width, bg_shift=bg_shift, theme=theme))
+    if layout == 'classic':
+        sys.stdout.write(render_classic(info, width))
+    else:
+        sys.stdout.write(render(info, width, bg_shift=bg_shift, theme=theme))
 
 
 if __name__ == '__main__':
